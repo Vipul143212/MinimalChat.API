@@ -1,5 +1,7 @@
-﻿using Microsoft.EntityFrameworkCore;
+﻿using AutoMapper;
+using Microsoft.EntityFrameworkCore;
 using MinimalChat.Domain.DTOs;
+using MinimalChat.Domain.Enum;
 using MinimalChat.Domain.Interfaces;
 using MinimalChat.Domain.Models;
 using MinmalChat.Data.Context;
@@ -16,13 +18,13 @@ namespace MinmalChat.Data.Services
     {
         private readonly IRepository<Group> _groupRepository;
         private readonly IRepository<GroupMember> _groupMemberRepository;
-        private readonly MinimalChatDbContext _context;
+        private readonly IMapper _mapper;
 
-        public GroupService(IRepository<Group> groupRepository, IRepository<GroupMember> groupMemberRepository, MinimalChatDbContext context)
+        public GroupService(IRepository<Group> groupRepository, IRepository<GroupMember> groupMemberRepository, IMapper mapper)
         {
             _groupRepository = groupRepository;
             _groupMemberRepository = groupMemberRepository;
-            _context = context;
+            _mapper = mapper;
         }
 
         /// <summary>
@@ -33,7 +35,7 @@ namespace MinmalChat.Data.Services
         /// <returns>
         ///   A task representing the asynchronous operation, with the created Group object.
         /// </returns>
-        public async Task<Group> CreateGroupAsync(string? currentUser, GroupDto groupDto)
+        public async Task<ResponseGroupDto> CreateGroupAsync(string? currentUser, GroupDto groupDto)
         {
             var group = new Group
             {
@@ -60,13 +62,14 @@ namespace MinmalChat.Data.Services
                         GroupId = addedGroup.Id,
                         UserId = memberId.ToString(),
                         IsAdmin = isAdmin,
+                        ChatHistoryTime = DateTime.Now,
                     };
 
                     await _groupMemberRepository.AddAsync(groupMember);
                 }
             }
 
-            return addedGroup;
+            return _mapper.Map<ResponseGroupDto>(addedGroup);
         }
 
         /// <summary>
@@ -78,16 +81,16 @@ namespace MinmalChat.Data.Services
         /// <returns>
         ///   A task representing the asynchronous operation, with a string result indicating the outcome.
         /// </returns>
-        public async Task<string> AddMemberToGroupAsync(Guid groupId, string? currentUserId, List<Guid> memberIds)
+        public async Task<string> AddMemberToGroupAsync(Guid groupId, string? currentUserId, AddGroupMemberDto addGroupMemberDto)
         {
             // Check if the group exists
-            var group = await _context.Groups.FirstOrDefaultAsync(grp => grp.Id == groupId);
+            var group = await _groupRepository.GetGroupByIdAsync(groupId);
             if (group == null)
             {
                 return "Group not found";
             }
 
-            var groupMember =  await _context.GroupMembers.FirstOrDefaultAsync(grpmem => grpmem.UserId == currentUserId);
+            var groupMember =  await _groupMemberRepository.GetGroupMemberByIdAsync(currentUserId);
 
             if (groupMember != null && !groupMember.IsAdmin)
             {
@@ -96,26 +99,37 @@ namespace MinmalChat.Data.Services
 
             Guid currentUserGuid = Guid.Parse(currentUserId!);
 
-            foreach (var memberId in memberIds)
-            {
-                // Check if the member already exists in the group
-                var memberExists = await _context.GroupMembers.AnyAsync(grpmem => grpmem.GroupId == groupId && grpmem.UserId == memberId.ToString());
+            // Check if the member already exists in the group
+            var memberExists = await _groupMemberRepository.MemberExistsInGroupAsync(groupId, addGroupMemberDto.memberId.ToString());
 
-                if (memberExists)
-                {
-                    // Handle the case where the member already exists in the group
-                    return $"Member with ID {memberId} already exists in the group";
-                }
-                var isAdmin = memberId == currentUserGuid;
-                var groupUser = new GroupMember
-                {
-                    GroupId = groupId,
-                    UserId = memberId.ToString(),
-                    IsAdmin = isAdmin,
+            if (memberExists != null)
+            {
+                // Handle the case where the member already exists in the group
+                return $"Member with ID {addGroupMemberDto.memberId} already exists in the group";
+            }
+            DateTime? chatHistoryTime = null;
+            if(addGroupMemberDto.HistoryOption == HistoryOption.ShowAllHistory)
+            {
+                chatHistoryTime = await _groupMemberRepository.GetChatHistoryTimeAsync(groupId);
+            }
+            else if(addGroupMemberDto.HistoryOption == HistoryOption.ShowNumberOfDays && addGroupMemberDto.Days != null)
+            {
+                chatHistoryTime = DateTime.Now.AddDays(-(double)addGroupMemberDto.Days);
+            }
+            else if(addGroupMemberDto.HistoryOption == HistoryOption.NoHistory)
+            {
+                chatHistoryTime = DateTime.Now;
+            }
+
+            var groupUser = new GroupMember
+            {
+                GroupId = groupId,
+                UserId = addGroupMemberDto.memberId.ToString(),
+                IsAdmin = false,
+                ChatHistoryTime = chatHistoryTime ?? null,
                 };
 
                 await _groupMemberRepository.AddAsync(groupUser);
-            }
             return "Member Added Successfully!";
         }
 
@@ -131,13 +145,13 @@ namespace MinmalChat.Data.Services
         public async Task<string> RemoveMemberFromGroupAsync(Guid groupId, string? currentUserId, Guid memberId)
         {
             // Check if the group exists
-            var group = await _context.Groups.FirstOrDefaultAsync(grp => grp.Id == groupId);
+            var group = await _groupRepository.GetGroupByIdAsync(groupId);
             if (group == null)
             {
                 return "Group not found";
             }
 
-            var groupMember = await _context.GroupMembers.FirstOrDefaultAsync(grpmem => grpmem.UserId == currentUserId);
+            var groupMember = await _groupMemberRepository.MemberExistsInGroupAsync(groupId, currentUserId);
 
             if (groupMember != null && !groupMember.IsAdmin)
             {
@@ -145,7 +159,7 @@ namespace MinmalChat.Data.Services
             }
 
             // Check if the member exists in the group
-            var memberExists = await _context.GroupMembers.FirstOrDefaultAsync(grpmem => grpmem.GroupId == groupId && grpmem.UserId == memberId.ToString());
+            var memberExists = await _groupMemberRepository.MemberExistsInGroupAsync(groupId, memberId.ToString());
 
             if (memberExists == null)
             {
@@ -153,8 +167,7 @@ namespace MinmalChat.Data.Services
             }
 
             // Remove the member from the group
-            _context.GroupMembers.Remove(memberExists);
-            await _context.SaveChangesAsync();
+            await _groupMemberRepository.DeleteAsync(memberExists);
 
             return "Member Removed Successfully!";
         }
@@ -172,7 +185,7 @@ namespace MinmalChat.Data.Services
         /// </returns>
         public async Task<string> EditGroupNameAsync(Guid groupId, string newName)
         {
-            var group = await _context.Groups.FindAsync(groupId);
+            var group = await _groupRepository.GetGroupByIdAsync(groupId);
 
             if (group == null)
             {
@@ -180,7 +193,7 @@ namespace MinmalChat.Data.Services
             }
 
             group.Name = newName;
-            await _context.SaveChangesAsync();
+            await _groupRepository.UpdateAsync(group);
 
             return "Name updated sucessfully!";
         }
@@ -198,22 +211,20 @@ namespace MinmalChat.Data.Services
         /// </returns>
         public async Task<string> MakeMemberAdminAsync(Guid groupId, Guid memberId, string? currentUserId)
         {
-            var group = await _context.Groups.FindAsync(groupId);
+            var group = await _groupRepository.GetGroupByIdAsync(groupId);
 
             if (group == null)
             {
                 return "Group not found";
             }
-            var currentUser = await _context.GroupMembers.FirstOrDefaultAsync(grpmem => grpmem.UserId == currentUserId);
+            var currentUser = await _groupMemberRepository.MemberExistsInGroupAsync(groupId, currentUserId);
 
             if (currentUser != null && !currentUser.IsAdmin)
             {
                 return "You are not an admin! You can't make admin to anyone!";
             }
 
-            var groupMember = await _context.GroupMembers
-                .Where(gm => gm.GroupId == groupId && gm.UserId == memberId.ToString())
-                .FirstOrDefaultAsync();
+            var groupMember = await _groupMemberRepository.MemberExistsInGroupAsync(groupId, memberId.ToString());
 
             if (groupMember == null)
             {
@@ -222,7 +233,7 @@ namespace MinmalChat.Data.Services
 
             groupMember.IsAdmin = true;
 
-            await _context.SaveChangesAsync();
+            await _groupMemberRepository.UpdateAsync(groupMember);
 
             return "Member is now an admin";
         }
@@ -235,24 +246,21 @@ namespace MinmalChat.Data.Services
         /// <returns>A message indicating the result of the deletion.</returns>
         public async Task<string> DeleteGroupAsync(Guid groupId, string? currentUser)
         {
-            var group = await _context.Groups.FindAsync(groupId);
+            var group = await _groupRepository.GetGroupByIdAsync(groupId);
 
             if (group == null)
             {
                 return "Group not found";
             }
 
-            var groupMember = await _context.GroupMembers
-                .Where(gm => gm.GroupId == groupId && gm.UserId == currentUser)
-                .FirstOrDefaultAsync();
+            var groupMember = await _groupMemberRepository.MemberExistsInGroupAsync(groupId, currentUser);
 
             if (groupMember == null || !groupMember.IsAdmin)
             {
                 return "You do not have permission to delete this group";
             }
 
-            _context.Groups.Remove(group);
-            await _context.SaveChangesAsync();
+            await _groupRepository.DeleteAsync(group);
 
             return "Group deleted successfully";
         }
